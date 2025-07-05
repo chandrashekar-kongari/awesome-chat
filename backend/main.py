@@ -2,7 +2,7 @@ import asyncio
 import random
 import os
 from typing import AsyncGenerator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,6 +25,40 @@ except ImportError:
 import json
 from dotenv import load_dotenv
 from typing import Any
+from pathlib import Path
+
+# LlamaIndex imports
+try:
+    # Import core components first
+    from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, StorageContext
+    from llama_index.core.node_parser import SentenceSplitter
+    from llama_index.core.schema import Document, TextNode
+    from llama_index.readers.file import PyMuPDFReader
+    from llama_index.embeddings.openai import OpenAIEmbedding
+    from llama_index.llms.openai import OpenAI as LlamaIndexOpenAI
+    from llama_index.core.retrievers import VectorIndexRetriever
+    from llama_index.core.query_engine import RetrieverQueryEngine
+    from llama_index.core.postprocessor import SimilarityPostprocessor
+    from llama_index.core.settings import Settings
+    from llama_index.core import QueryBundle
+    
+    # Pinecone imports
+    from pinecone import Pinecone, ServerlessSpec
+    from llama_index.vector_stores.pinecone import PineconeVectorStore
+    
+    LLAMAINDEX_AVAILABLE = True
+    PINECONE_AVAILABLE = True
+    print("✅ LlamaIndex dependencies imported successfully (with Pinecone support)")
+except ImportError as e:
+    print(f"⚠️  LlamaIndex not available: {e}")
+    print("To enable LlamaIndex functionality, run: bash setup_llamaindex.sh")
+    LLAMAINDEX_AVAILABLE = False
+    PINECONE_AVAILABLE = False
+except Exception as e:
+    print(f"❌ Error importing LlamaIndex: {e}")
+    print("This might be due to version conflicts. Try running: bash setup_llamaindex.sh")
+    LLAMAINDEX_AVAILABLE = False
+    PINECONE_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -37,6 +71,227 @@ if not os.getenv("OPENAI_API_KEY"):
 
 # Initialize OpenAI client for observation and reflection tools
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize LlamaIndex if available
+document_manager = None
+if LLAMAINDEX_AVAILABLE:
+    try:
+        # Configure LlamaIndex settings
+        Settings.llm = LlamaIndexOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+        Settings.embed_model = OpenAIEmbedding(
+            model="text-embedding-3-small",
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+        
+        class DocumentManager:
+            """Manages document indexing and retrieval using LlamaIndex with Pinecone."""
+            
+            def __init__(self):
+                self.indexes = {}
+                self.query_engines = {}
+                self.documents_dir = Path("./documents")
+                self.documents_dir.mkdir(exist_ok=True)
+                
+                # Initialize Pinecone client
+                self.pinecone_client = None
+                self.pinecone_index = None
+                
+                # Initialize Pinecone (required)
+                if not PINECONE_AVAILABLE:
+                    raise ImportError("Pinecone is required but not available. Please install: pip install pinecone-client llama-index-vector-stores-pinecone")
+                
+                pinecone_api_key = os.getenv("PINECONE_API_KEY")
+                if not pinecone_api_key:
+                    raise ValueError("PINECONE_API_KEY environment variable is required")
+                
+                self.pinecone_client = Pinecone(api_key=pinecone_api_key)
+                self.pinecone_index_name = os.getenv("PINECONE_INDEX_NAME", "llamaindex-documents")
+                self.pinecone_namespace = os.getenv("PINECONE_NAMESPACE", "default")
+                self.pinecone_environment = os.getenv("PINECONE_ENVIRONMENT", "us-east-1-aws")
+                
+                # Create index if it doesn't exist
+                self._ensure_pinecone_index()
+                
+                print("✅ DocumentManager initialized successfully with Pinecone")
+            
+            def _ensure_pinecone_index(self):
+                """Ensure the Pinecone index exists, create if it doesn't."""
+                try:
+                    # Check if index exists
+                    existing_indexes = self.pinecone_client.list_indexes()
+                    index_names = [index.name for index in existing_indexes]
+                    
+                    if self.pinecone_index_name not in index_names:
+                        # Parse region from environment string (e.g., "us-east-1-aws" -> "us-east-1")
+                        region_parts = self.pinecone_environment.split('-')
+                        if len(region_parts) >= 3:
+                            # Handle format like "us-east-1-aws"
+                            region = '-'.join(region_parts[:-1])  # Remove the last part (cloud provider)
+                        else:
+                            # Fallback to the full environment string
+                            region = self.pinecone_environment
+                        
+                        print(f"🔧 Creating Pinecone index in region: {region}")
+                        
+                        # Create new index
+                        self.pinecone_client.create_index(
+                            name=self.pinecone_index_name,
+                            dimension=1536,  # OpenAI embedding dimension
+                            metric='cosine',
+                            spec=ServerlessSpec(
+                                cloud='aws',
+                                region=region
+                            )
+                        )
+                        print(f"✅ Created Pinecone index: {self.pinecone_index_name}")
+                    else:
+                        print(f"✅ Using existing Pinecone index: {self.pinecone_index_name}")
+                    
+                    # Connect to the index
+                    self.pinecone_index = self.pinecone_client.Index(self.pinecone_index_name)
+                    
+                except Exception as e:
+                    print(f"❌ Error setting up Pinecone index: {e}")
+                    raise
+            
+            async def index_document(self, file_path: str, collection_name: str = "default") -> str:
+                """Index a document and return status."""
+                try:
+                    file_path = Path(file_path)
+                    if not file_path.exists():
+                        return f"❌ File not found: {file_path}"
+                    
+                    # Choose appropriate reader based on file type
+                    if file_path.suffix.lower() == '.pdf':
+                        reader = PyMuPDFReader()
+                        documents = reader.load_data(file_path)
+                    else:
+                        reader = SimpleDirectoryReader(input_files=[str(file_path)])
+                        documents = reader.load_data()
+                    
+                    # Create Pinecone vector store
+                    vector_store = PineconeVectorStore(
+                        pinecone_index=self.pinecone_index,
+                        namespace=f"{self.pinecone_namespace}_{collection_name}"
+                    )
+                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                    
+                    # Create index
+                    index = VectorStoreIndex.from_documents(
+                        documents, 
+                        storage_context=storage_context,
+                        show_progress=True
+                    )
+                    
+                    # Store index and create query engine
+                    self.indexes[collection_name] = index
+                    self.query_engines[collection_name] = index.as_query_engine(
+                        similarity_top_k=3,
+                        streaming=True
+                    )
+                    
+                    return f"✅ Successfully indexed {file_path.name} in collection '{collection_name}' (Pinecone)"
+                    
+                except Exception as e:
+                    return f"❌ Error indexing document: {str(e)}"
+            
+            async def query_documents(self, query: str, collection_name: str = "default") -> str:
+                """Query documents in a collection."""
+                try:
+                    if collection_name not in self.query_engines:
+                        # Try to recreate the index from Pinecone if it doesn't exist in memory
+                        try:
+                            vector_store = PineconeVectorStore(
+                                pinecone_index=self.pinecone_index,
+                                namespace=f"{self.pinecone_namespace}_{collection_name}"
+                            )
+                            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                            index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
+                            self.indexes[collection_name] = index
+                            self.query_engines[collection_name] = index.as_query_engine(
+                                similarity_top_k=3,
+                                streaming=True
+                            )
+                        except Exception as e:
+                            return f"❌ Error connecting to Pinecone collection '{collection_name}': {str(e)}"
+                    
+                    query_engine = self.query_engines[collection_name]
+                    response = query_engine.query(query)
+                    
+                    # Format response with sources
+                    result = f"📄 Query Result (Pinecone):\n\n{response}\n\n"
+                    
+                    if hasattr(response, 'source_nodes') and response.source_nodes:
+                        result += "📚 Sources:\n"
+                        for i, node in enumerate(response.source_nodes[:2], 1):
+                            score = getattr(node, 'score', 'N/A')
+                            result += f"  {i}. Score: {score:.3f}\n"
+                            if hasattr(node, 'node') and hasattr(node.node, 'metadata'):
+                                metadata = node.node.metadata
+                                if 'file_name' in metadata:
+                                    result += f"     Source: {metadata['file_name']}\n"
+                                if 'page_label' in metadata:
+                                    result += f"     Page: {metadata['page_label']}\n"
+                    
+                    return result
+                    
+                except Exception as e:
+                    return f"❌ Error querying documents: {str(e)}"
+            
+            async def list_collections(self) -> str:
+                """List all available document collections."""
+                try:
+                    # Check in-memory collections
+                    collections = set(self.indexes.keys())
+                    
+                    if collections:
+                        result = f"📚 Available Collections (Pinecone):\n"
+                        for collection in collections:
+                            if collection in self.indexes:
+                                # In-memory collection
+                                count = len(self.indexes[collection].docstore.docs)
+                                result += f"  • {collection}: {count} documents (loaded)\n"
+                            else:
+                                result += f"  • {collection}: (in Pinecone)\n"
+                        return result
+                    else:
+                        return f"📚 No document collections found (Pinecone). Use index_document() to create one."
+                except Exception as e:
+                    return f"❌ Error listing collections: {str(e)}"
+            
+            async def delete_collection(self, collection_name: str) -> str:
+                """Delete a document collection."""
+                try:
+                    if collection_name in self.indexes:
+                        del self.indexes[collection_name]
+                    if collection_name in self.query_engines:
+                        del self.query_engines[collection_name]
+                    
+                    # For Pinecone, delete the namespace
+                    try:
+                        namespace = f"{self.pinecone_namespace}_{collection_name}"
+                        # Note: Pinecone doesn't have a direct delete namespace method
+                        # We would need to delete all vectors in the namespace
+                        # This is a more complex operation that might require listing and deleting vectors
+                        print(f"⚠️  Pinecone namespace '{namespace}' vectors should be manually deleted")
+                    except Exception as e:
+                        print(f"⚠️  Could not delete Pinecone namespace: {e}")
+                    
+                    return f"✅ Successfully deleted collection '{collection_name}' from memory (Pinecone)"
+                except Exception as e:
+                    return f"❌ Error deleting collection: {str(e)}"
+        
+        document_manager = DocumentManager()
+        print("📚 LlamaIndex DocumentManager initialized successfully")
+        
+    except Exception as e:
+        print(f"❌ Error initializing LlamaIndex: {e}")
+        LLAMAINDEX_AVAILABLE = False
+        document_manager = None
 
 app = FastAPI(title="OpenAI Agents Chat API")
 
@@ -250,6 +505,110 @@ async def reflect_on_progress(reflection: str) -> str:
         print(f"Error generating reflection: {e}")
         return f"Reflection recorded: {reflection}"
 
+# LlamaIndex function tools
+if LLAMAINDEX_AVAILABLE and document_manager:
+    @function_tool
+    async def index_document(file_path: str, collection_name: str = "default") -> str:
+        """Index a document (PDF, TXT, etc.) for retrieval and search. Provide the file path and optionally a collection name to organize documents."""
+        await asyncio.sleep(2)  # Simulate processing time
+        return await document_manager.index_document(file_path, collection_name)
+    
+    @function_tool
+    async def query_documents(query: str, collection_name: str = "default") -> str:
+        """Search and retrieve information from indexed documents. Provide a natural language query and optionally specify which collection to search."""
+        await asyncio.sleep(2)  # Simulate processing time
+        return await document_manager.query_documents(query, collection_name)
+    
+    @function_tool
+    async def list_document_collections() -> str:
+        """List all available document collections and their document counts."""
+        await asyncio.sleep(1)  # Simulate processing time
+        return await document_manager.list_collections()
+    
+    @function_tool
+    async def delete_document_collection(collection_name: str) -> str:
+        """Delete a document collection and all its indexed documents. Use with caution!"""
+        await asyncio.sleep(1)  # Simulate processing time
+        return await document_manager.delete_collection(collection_name)
+    
+    @function_tool
+    async def create_document_summary(file_path: str, collection_name: str = "summary") -> str:
+        """Create a comprehensive summary of a document by indexing it and generating an overview."""
+        try:
+            await asyncio.sleep(1)  # Simulate processing time
+            
+            # First index the document
+            index_result = await document_manager.index_document(file_path, collection_name)
+            if "❌" in index_result:
+                return index_result
+            
+            # Then query for a summary
+            summary_query = "Provide a comprehensive summary of this document including key points, main topics, and important details."
+            summary_result = await document_manager.query_documents(summary_query, collection_name)
+            
+            return f"📄 Document Summary for {file_path}:\n\n{summary_result}"
+            
+        except Exception as e:
+            return f"❌ Error creating document summary: {str(e)}"
+    
+    @function_tool
+    async def semantic_search_documents(query: str, collection_name: str = "default", top_k: int = 5) -> str:
+        """Perform semantic search across documents to find the most relevant passages for a query."""
+        try:
+            await asyncio.sleep(2)  # Simulate processing time
+            
+            if collection_name not in document_manager.indexes:
+                # Try to load the collection from Pinecone first
+                try:
+                    vector_store = PineconeVectorStore(
+                        pinecone_index=document_manager.pinecone_index,
+                        namespace=f"{document_manager.pinecone_namespace}_{collection_name}"
+                    )
+                    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                    index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
+                    document_manager.indexes[collection_name] = index
+                except Exception as e:
+                    return f"❌ Error loading Pinecone collection '{collection_name}': {str(e)}"
+            
+            # Get the index and create a custom retriever
+            index = document_manager.indexes[collection_name]
+            retriever = VectorIndexRetriever(
+                index=index,
+                similarity_top_k=top_k
+            )
+            
+            # Perform retrieval
+            query_bundle = QueryBundle(query)
+            nodes = retriever.retrieve(query_bundle)
+            
+            # Format results
+            result = f"🔍 Semantic Search Results (Pinecone) for: '{query}'\n\n"
+            
+            for i, node in enumerate(nodes, 1):
+                score = getattr(node, 'score', 'N/A')
+                result += f"📄 Result {i} (Score: {score:.3f}):\n"
+                result += f"{node.node.text[:300]}{'...' if len(node.node.text) > 300 else ''}\n\n"
+            
+            return result
+            
+        except Exception as e:
+            return f"❌ Error performing semantic search: {str(e)}"
+    
+    # List of available tools when LlamaIndex is available
+    llamaindex_tools = [
+        index_document,
+        query_documents,
+        list_document_collections,
+        delete_document_collection,
+        create_document_summary,
+        semantic_search_documents
+    ]
+    
+    print("📚 LlamaIndex function tools created successfully")
+else:
+    llamaindex_tools = []
+    print("📚 LlamaIndex tools not available - install dependencies to enable")
+
 async def stream_agent_response(message: str) -> AsyncGenerator[str, None]:
     """Stream the agent's response with improved error handling and connection management."""
     agent = None
@@ -263,6 +622,10 @@ async def stream_agent_response(message: str) -> AsyncGenerator[str, None]:
         await asyncio.sleep(0.01)
         
         # Create agent with multiple tools using ReAct pattern
+        # Combine base tools with LlamaIndex tools
+        base_tools = [how_many_jokes, get_random_fact, calculate_math, get_weather_info, observe_result, reflect_on_progress]
+        all_tools = base_tools + llamaindex_tools
+        
         agent = Agent(
             name="Assistant",
             model="gpt-4o",
@@ -324,12 +687,21 @@ async def stream_agent_response(message: str) -> AsyncGenerator[str, None]:
 
             ## 🛠️ Available Tools:
 
+            ### Basic Tools:
             🎭 **how_many_jokes()** - Returns a random number (1-10) of jokes to tell
             🧠 **get_random_fact()** - Returns fascinating trivia and facts
             🧮 **calculate_math(expression)** - Safely evaluates mathematical expressions
             🌤️ **get_weather_info(city)** - Returns weather information for a city
             👁️ **observe_result(observation)** - Record observations about results or findings (provides intelligent analysis)
             🤔 **reflect_on_progress(reflection)** - Record reflections about progress and next steps (provides strategic recommendations)
+
+            ### Document & RAG Tools (LlamaIndex):
+            📁 **index_document(file_path, collection_name)** - Index a document (PDF, TXT, etc.) for retrieval and search
+            🔍 **query_documents(query, collection_name)** - Search and retrieve information from indexed documents using natural language
+            📚 **list_document_collections()** - List all available document collections and their document counts
+            🗑️ **delete_document_collection(collection_name)** - Delete a document collection (use with caution!)
+            📄 **create_document_summary(file_path, collection_name)** - Create a comprehensive summary of a document
+            🎯 **semantic_search_documents(query, collection_name, top_k)** - Perform semantic search to find relevant document passages
 
             ## 📝 Response Format:
 
@@ -352,6 +724,14 @@ async def stream_agent_response(message: str) -> AsyncGenerator[str, None]:
             **REFLECT:** [Call reflect_on_progress("Math calculation completed")]
             **DECISION:** [If reflection suggests verification needed, continue. If confirmed complete, finish.]
 
+            **User:** "Can you analyze this PDF document for me?"
+            **THOUGHT:** The user wants me to analyze a document. I need to index it first, then query it.
+            **PLAN:** 1) Index the document, 2) Create a summary, 3) Allow for follow-up questions
+            **ACT:** [Call index_document("path/to/document.pdf", "user_document")]
+            **OBSERVE:** [Call observe_result("Document was successfully indexed")]
+            **REFLECT:** [Call reflect_on_progress("Document is ready for analysis")]
+            **DECISION:** [Create summary and ask if user has specific questions]
+
             ## 🔄 Adaptive Iteration Rules:
             - **NEVER stop after just one action** - always observe and reflect first
             - **Act on recommendations** from observe_result() and reflect_on_progress()
@@ -367,9 +747,10 @@ async def stream_agent_response(message: str) -> AsyncGenerator[str, None]:
             3. **Take additional actions if recommendations suggest them**
             4. **Don't stop until reflection confirms complete success**
             5. **Use insights to improve your approach dynamically**
+            6. **For document tasks, use the appropriate RAG tools for indexing and querying**
 
             Remember: Think step-by-step, plan carefully, act deliberately, observe intelligently, reflect strategically, and adapt based on insights!""",
-            tools=[how_many_jokes, get_random_fact, calculate_math, get_weather_info, observe_result, reflect_on_progress],
+            tools=all_tools,
         )
 
         # Initialize lifecycle hooks if available
@@ -673,6 +1054,30 @@ async def chat_stream(chat_message: ChatMessage):
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "message": "OpenAI Agents Chat API is running"}
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file for document processing."""
+    try:
+        # Create documents directory if it doesn't exist
+        documents_dir = Path("./documents")
+        documents_dir.mkdir(exist_ok=True)
+        
+        # Save the uploaded file
+        file_path = documents_dir / file.filename
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        return {
+            "status": "success",
+            "message": f"File '{file.filename}' uploaded successfully",
+            "file_path": str(file_path),
+            "size": len(content),
+            "instructions": "Use the chat interface to index and query this document with commands like: 'Index the document ./documents/" + file.filename + "'"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
